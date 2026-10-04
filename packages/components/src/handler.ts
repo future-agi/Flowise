@@ -25,6 +25,7 @@ import { AgentAction } from '@langchain/core/agents'
 import { LunaryHandler } from '@langchain/community/callbacks/handlers/lunary'
 
 import { getCredentialData, getCredentialParam, getEnvironmentVariable } from './utils'
+import { collectorEndpoint, exporterHeaders } from './futureagi'
 import { applyEnvTracingProviders, tracingEnvEnabled } from './tracingEnv'
 import { EvaluationRunTracer } from '../evaluation/EvaluationRunTracer'
 import { EvaluationRunTracerLlama } from '../evaluation/EvaluationRunTracerLlama'
@@ -151,15 +152,10 @@ interface FutureAGITracerOptions {
 // separate tracer rather than a retarget of getPhoenixTracer.
 export function getFutureAGITracer(options: FutureAGITracerOptions): Tracer | undefined {
     try {
-        const parsedURL = new URL(options.baseUrl)
-        const path = parsedURL.pathname.replace(/\/$/, '').replace(/\/tracer\/v1\/traces$/, '')
-        const exporterUrl = `${parsedURL.protocol}//${parsedURL.host}${path}/tracer/v1/traces`
+        const exporterUrl = collectorEndpoint(options.baseUrl)
         const traceExporter = new ProtoOTLPTraceExporter({
             url: exporterUrl,
-            headers: {
-                'X-Api-Key': options.apiKey || '',
-                'X-Secret-Key': options.secretKey || ''
-            }
+            headers: exporterHeaders(options.apiKey, options.secretKey)
         })
         const tracerProvider = new NodeTracerProvider({
             resource: new Resource({
