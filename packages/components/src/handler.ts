@@ -25,6 +25,7 @@ import { AgentAction } from '@langchain/core/agents'
 import { LunaryHandler } from '@langchain/community/callbacks/handlers/lunary'
 
 import { getCredentialData, getCredentialParam, getEnvironmentVariable } from './utils'
+import { collectorEndpoint, exporterHeaders, resolveProjectName } from './futureagi'
 import { applyEnvTracingProviders, tracingEnvEnabled } from './tracingEnv'
 import { EvaluationRunTracer } from '../evaluation/EvaluationRunTracer'
 import { EvaluationRunTracerLlama } from '../evaluation/EvaluationRunTracerLlama'
@@ -133,6 +134,49 @@ export function getPhoenixTracer(options: PhoenixTracerOptions): Tracer | undefi
         return tracerProvider.getTracer(`phoenix-tracer-${uuidv4().toString()}`)
     } catch (err) {
         if (process.env.DEBUG === 'true') console.error(`Error setting up Phoenix tracer: ${err.message}`)
+        return undefined
+    }
+}
+
+interface FutureAGITracerOptions {
+    apiKey: string
+    secretKey: string
+    baseUrl: string
+    projectName: string
+    enableCallback?: boolean
+}
+
+// fi-collector reads X-Api-Key and X-Secret-Key and requires a project_name
+// resource attribute. The Phoenix exporter sends api_key plus a Bearer token
+// and openinference.project.name, which the collector rejects, so this is a
+// separate tracer rather than a retarget of getPhoenixTracer.
+export function getFutureAGITracer(options: FutureAGITracerOptions): Tracer | undefined {
+    try {
+        const exporterUrl = collectorEndpoint(options.baseUrl)
+        const traceExporter = new ProtoOTLPTraceExporter({
+            url: exporterUrl,
+            headers: exporterHeaders(options.apiKey, options.secretKey)
+        })
+        const tracerProvider = new NodeTracerProvider({
+            resource: new Resource({
+                [ATTR_SERVICE_NAME]: options.projectName,
+                [ATTR_SERVICE_VERSION]: '1.0.0',
+                project_name: options.projectName,
+                project_type: 'observe'
+            })
+        })
+        tracerProvider.addSpanProcessor(new SimpleSpanProcessor(traceExporter))
+        if (options.enableCallback) {
+            registerInstrumentations({
+                instrumentations: []
+            })
+            const lcInstrumentation = new LangChainInstrumentation()
+            lcInstrumentation.manuallyInstrument(CallbackManagerModule)
+            tracerProvider.register()
+        }
+        return tracerProvider.getTracer(`futureagi-tracer-${uuidv4().toString()}`)
+    } catch (err) {
+        if (process.env.DEBUG === 'true') console.error(`Error setting up Future AGI tracer: ${err.message}`)
         return undefined
     }
 }
@@ -658,6 +702,25 @@ export const additionalCallbacks = async (nodeData: INodeData, options: ICommonO
 
                     const tracer: Tracer | undefined = getPhoenixTracer(phoenixOptions)
                     callbacks.push(tracer)
+                } else if (provider === 'futureAgi') {
+                    const futureAgiApiKey = getCredentialParam('futureAgiApiKey', credentialData, nodeData)
+                    const futureAgiSecretKey = getCredentialParam('futureAgiSecretKey', credentialData, nodeData)
+                    const futureAgiEndpoint = getCredentialParam('futureAgiEndpoint', credentialData, nodeData)
+                    const futureAgiProject = resolveProjectName(
+                        analytic[provider].projectName as string,
+                        getCredentialParam('futureAgiProject', credentialData, nodeData)
+                    )
+
+                    const futureAgiOptions: FutureAGITracerOptions = {
+                        apiKey: futureAgiApiKey,
+                        secretKey: futureAgiSecretKey,
+                        baseUrl: futureAgiEndpoint ?? 'https://api.futureagi.com',
+                        projectName: futureAgiProject ?? 'default',
+                        enableCallback: true
+                    }
+
+                    const tracer: Tracer | undefined = getFutureAGITracer(futureAgiOptions)
+                    callbacks.push(tracer)
                 } else if (provider === 'opik') {
                     const opikApiKey = getCredentialParam('opikApiKey', credentialData, nodeData)
                     const opikEndpoint = getCredentialParam('opikUrl', credentialData, nodeData)
@@ -891,6 +954,27 @@ export class AnalyticHandler {
             const rootSpan: Span | undefined = undefined
 
             this.handlers['phoenix'] = { client: phoenix, phoenixProject, rootSpan }
+        } else if (provider === 'futureAgi') {
+            const futureAgiApiKey = getCredentialParam('futureAgiApiKey', credentialData, this.nodeData)
+            const futureAgiSecretKey = getCredentialParam('futureAgiSecretKey', credentialData, this.nodeData)
+            const futureAgiEndpoint = getCredentialParam('futureAgiEndpoint', credentialData, this.nodeData)
+            const futureAgiProject = resolveProjectName(
+                providerConfig.projectName as string,
+                getCredentialParam('futureAgiProject', credentialData, this.nodeData)
+            )
+
+            const futureAgiOptions: FutureAGITracerOptions = {
+                apiKey: futureAgiApiKey,
+                secretKey: futureAgiSecretKey,
+                baseUrl: futureAgiEndpoint ?? 'https://api.futureagi.com',
+                projectName: futureAgiProject ?? 'default',
+                enableCallback: false
+            }
+
+            const futureAgi: Tracer | undefined = getFutureAGITracer(futureAgiOptions)
+            const rootSpan: Span | undefined = undefined
+
+            this.handlers['futureAgi'] = { client: futureAgi, futureAgiProject, rootSpan }
         } else if (provider === 'opik') {
             const opikApiKey = getCredentialParam('opikApiKey', credentialData, this.nodeData)
             const opikEndpoint = getCredentialParam('opikUrl', credentialData, this.nodeData)

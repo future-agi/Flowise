@@ -1,5 +1,5 @@
 import { OTLPTraceExporter as ProtoOTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto'
-import { getPhoenixTracer, AnalyticHandler } from './handler'
+import { getPhoenixTracer, getFutureAGITracer, AnalyticHandler } from './handler'
 import { resetTracingEnvCache } from './tracingEnv'
 
 jest.mock('@opentelemetry/exporter-trace-otlp-proto', () => {
@@ -83,6 +83,50 @@ describe('URL Handling For Phoenix Tracer', () => {
                 })
             })
         )
+    })
+})
+
+describe('URL Handling For Future AGI Tracer', () => {
+    const apiKey = 'test-api-key'
+    const secretKey = 'test-secret-key'
+    const projectName = 'test-project'
+
+    const makeOptions = (baseUrl: string) => ({
+        baseUrl,
+        apiKey,
+        secretKey,
+        projectName,
+        enableCallback: false
+    })
+
+    beforeEach(() => {
+        jest.clearAllMocks()
+    })
+
+    const cases: [string, string][] = [
+        ['https://api.futureagi.com', 'https://api.futureagi.com/tracer/v1/traces'],
+        ['https://api.futureagi.com/tracer/v1/traces', 'https://api.futureagi.com/tracer/v1/traces'],
+        ['https://collector.example.com/base', 'https://collector.example.com/base/tracer/v1/traces']
+    ]
+
+    it.each(cases)('baseUrl %s - exporterUrl %s', (input, expected) => {
+        getFutureAGITracer(makeOptions(input))
+        expect(ProtoOTLPTraceExporter).toHaveBeenCalledWith(
+            expect.objectContaining({
+                url: expected,
+                headers: {
+                    'X-Api-Key': apiKey,
+                    'X-Secret-Key': secretKey
+                }
+            })
+        )
+    })
+
+    it('does not send the Phoenix header names', () => {
+        getFutureAGITracer(makeOptions('https://api.futureagi.com'))
+        const call = (ProtoOTLPTraceExporter as unknown as jest.Mock).mock.calls[0][0]
+        expect(call.headers.api_key).toBeUndefined()
+        expect(call.headers.authorization).toBeUndefined()
     })
 })
 
