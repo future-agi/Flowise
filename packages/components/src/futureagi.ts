@@ -17,4 +17,8 @@ function exporterHeaders(apiKey: string, secretKey: string): Record<string, stri
     }
 }
 
-export { collectorEndpoint, exporterHeaders, COLLECTOR_PATH }
+function resolveProjectName(analyticProject?: string, credentialProject?: string): string {
+    return analyticProject || credentialProject || 'default'
+}
+
+export { collectorEndpoint, exporterHeaders, COLLECTOR_PATH, resolveProjectName }

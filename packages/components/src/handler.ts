@@ -25,7 +25,7 @@ import { AgentAction } from '@langchain/core/agents'
 import { LunaryHandler } from '@langchain/community/callbacks/handlers/lunary'
 
 import { getCredentialData, getCredentialParam, getEnvironmentVariable } from './utils'
-import { collectorEndpoint, exporterHeaders } from './futureagi'
+import { collectorEndpoint, exporterHeaders, resolveProjectName } from './futureagi'
 import { applyEnvTracingProviders, tracingEnvEnabled } from './tracingEnv'
 import { EvaluationRunTracer } from '../evaluation/EvaluationRunTracer'
 import { EvaluationRunTracerLlama } from '../evaluation/EvaluationRunTracerLlama'
@@ -706,7 +706,10 @@ export const additionalCallbacks = async (nodeData: INodeData, options: ICommonO
                     const futureAgiApiKey = getCredentialParam('futureAgiApiKey', credentialData, nodeData)
                     const futureAgiSecretKey = getCredentialParam('futureAgiSecretKey', credentialData, nodeData)
                     const futureAgiEndpoint = getCredentialParam('futureAgiEndpoint', credentialData, nodeData)
-                    const futureAgiProject = analytic[provider].projectName as string
+                    const futureAgiProject = resolveProjectName(
+                        analytic[provider].projectName as string,
+                        getCredentialParam('futureAgiProject', credentialData, nodeData)
+                    )
 
                     const futureAgiOptions: FutureAGITracerOptions = {
                         apiKey: futureAgiApiKey,
@@ -955,7 +958,10 @@ export class AnalyticHandler {
             const futureAgiApiKey = getCredentialParam('futureAgiApiKey', credentialData, this.nodeData)
             const futureAgiSecretKey = getCredentialParam('futureAgiSecretKey', credentialData, this.nodeData)
             const futureAgiEndpoint = getCredentialParam('futureAgiEndpoint', credentialData, this.nodeData)
-            const futureAgiProject = providerConfig.projectName as string
+            const futureAgiProject = resolveProjectName(
+                providerConfig.projectName as string,
+                getCredentialParam('futureAgiProject', credentialData, this.nodeData)
+            )
 
             const futureAgiOptions: FutureAGITracerOptions = {
                 apiKey: futureAgiApiKey,
