@@ -12,7 +12,7 @@ class FutureAGIApi implements INodeCredential {
         this.name = 'futureAgiApi'
         this.version = 1.0
         this.description =
-            'Refer to <a target="_blank" href="https://docs.futureagi.com/docs/integrations/flowise">the Future AGI guide</a> for the API key, secret key and project name.'
+            'Refer to <a target="_blank" href="https://docs.futureagi.com/docs/integrations">the Future AGI docs</a> for the API key, secret key and project name.'
         this.inputs = [
             {
                 label: 'API Key',
