@@ -17,7 +17,7 @@ class FutureAGI_Analytic implements INode {
         this.name = 'futureAgi'
         this.version = 1.0
         this.type = 'FutureAGI'
-        this.icon = ''
+        this.icon = 'futureagi.svg'
         this.category = 'Analytic'
         this.baseClasses = [this.type]
         this.description = 'Send traces to Future AGI. Self-hosted Flowise only.'

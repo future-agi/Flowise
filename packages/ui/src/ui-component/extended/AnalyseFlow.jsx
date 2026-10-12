@@ -31,6 +31,7 @@ import lunarySVG from '@/assets/images/lunary.svg'
 import langwatchSVG from '@/assets/images/langwatch.svg'
 import arizePNG from '@/assets/images/arize.png'
 import phoenixPNG from '@/assets/images/phoenix.png'
+import futureAgiSVG from '@/assets/images/futureagi.svg'
 import opikPNG from '@/assets/images/opik.png'
 
 // store
@@ -181,6 +182,34 @@ const analyticProviders = [
                 type: 'string',
                 optional: true,
                 description: 'If not provided, default will be used.',
+                placeholder: 'default'
+            },
+            {
+                label: 'On/Off',
+                name: 'status',
+                type: 'boolean',
+                optional: true
+            }
+        ]
+    },
+    {
+        label: 'Future AGI',
+        name: 'futureAgi',
+        icon: futureAgiSVG,
+        url: 'https://futureagi.com',
+        inputs: [
+            {
+                label: 'Connect Credential',
+                name: 'credential',
+                type: 'credential',
+                credentialNames: ['futureAgiApi']
+            },
+            {
+                label: 'Project Name',
+                name: 'projectName',
+                type: 'string',
+                optional: true,
+                description: 'If not provided, the project from the credential is used.',
                 placeholder: 'default'
             },
             {
