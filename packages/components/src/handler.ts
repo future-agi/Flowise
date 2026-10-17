@@ -10,12 +10,12 @@ import { RunTree, RunTreeConfig, Client as LangsmithClient } from 'langsmith'
 import { Langfuse, LangfuseTraceClient, LangfuseSpanClient, LangfuseGenerationClient } from 'langfuse'
 import { LangChainInstrumentation } from '@arizeai/openinference-instrumentation-langchain'
 import { Metadata } from '@grpc/grpc-js'
-import opentelemetry, { Span, SpanStatusCode } from '@opentelemetry/api'
+import opentelemetry, { Span, SpanStatusCode, Tracer as ApiTracer } from '@opentelemetry/api'
 import { OTLPTraceExporter as GrpcOTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-grpc'
 import { OTLPTraceExporter as ProtoOTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto'
 import { registerInstrumentations } from '@opentelemetry/instrumentation'
 import { Resource } from '@opentelemetry/resources'
-import { SimpleSpanProcessor, Tracer } from '@opentelemetry/sdk-trace-base'
+import { BatchSpanProcessor, SimpleSpanProcessor, Tracer } from '@opentelemetry/sdk-trace-base'
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node'
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions'
 import { BaseCallbackHandler, NewTokenIndices, HandleLLMNewTokenCallbackFields } from '@langchain/core/callbacks/base'
@@ -27,7 +27,15 @@ import { AgentAction } from '@langchain/core/agents'
 import { LunaryHandler } from '@langchain/community/callbacks/handlers/lunary'
 
 import { getCredentialData, getCredentialParam, getEnvironmentVariable } from './utils'
-import { collectorEndpoint, exporterHeaders, resolveProjectName } from './futureagi'
+import {
+    collectorEndpoint,
+    exporterHeaders,
+    FutureAGISpanExporter,
+    resolvePrivacy,
+    resolveProjectName,
+    runAttributes,
+    tracerWithAttributes
+} from './futureagi'
 import { applyEnvTracingProviders, tracingEnvEnabled } from './tracingEnv'
 import { EvaluationRunTracer } from '../evaluation/EvaluationRunTracer'
 import { EvaluationRunTracerLlama } from '../evaluation/EvaluationRunTracerLlama'
@@ -145,11 +153,20 @@ interface FutureAGITracerOptions {
     secretKey: string
     baseUrl: string
     projectName: string
+    hideInputs?: boolean | string
+    hideOutputs?: boolean | string
 }
 
-// One provider per collector, credential and project, reused across runs rather than
-// building a new exporter for every prediction.
+// One provider per collector, credential, project and privacy setting, reused across runs
+// rather than building a new exporter for every prediction.
 const futureAgiProviders = new Map<string, NodeTracerProvider>()
+
+/**
+ * Exports every buffered Future AGI span. Called on shutdown so the last batch is not lost.
+ */
+export async function flushFutureAGITracers(): Promise<void> {
+    await Promise.all(Array.from(futureAgiProviders.values()).map((provider) => provider.forceFlush().catch(() => undefined)))
+}
 
 // fi-collector reads X-Api-Key and X-Secret-Key and requires a project_name
 // resource attribute. The Phoenix exporter sends api_key plus a Bearer token
@@ -163,13 +180,19 @@ const futureAgiProviders = new Map<string, NodeTracerProvider>()
 export function getFutureAGITracer(options: FutureAGITracerOptions): Tracer | undefined {
     try {
         const exporterUrl = collectorEndpoint(options.baseUrl)
-        const key = JSON.stringify([exporterUrl, options.apiKey, options.secretKey, options.projectName])
+        const privacy = resolvePrivacy({ hideInputs: options.hideInputs, hideOutputs: options.hideOutputs })
+        const key = JSON.stringify([exporterUrl, options.apiKey, options.secretKey, options.projectName, privacy])
         let tracerProvider = futureAgiProviders.get(key)
         if (!tracerProvider) {
-            const traceExporter = new ProtoOTLPTraceExporter({
-                url: exporterUrl,
-                headers: exporterHeaders(options.apiKey, options.secretKey)
-            })
+            // Spans are scrubbed (hidden content, stack traces, local paths) before they leave the process.
+            const traceExporter = new FutureAGISpanExporter(
+                new ProtoOTLPTraceExporter({
+                    url: exporterUrl,
+                    headers: exporterHeaders(options.apiKey, options.secretKey),
+                    timeoutMillis: 10000
+                }),
+                privacy
+            )
             tracerProvider = new NodeTracerProvider({
                 resource: new Resource({
                     [ATTR_SERVICE_NAME]: options.projectName,
@@ -178,7 +201,16 @@ export function getFutureAGITracer(options: FutureAGITracerOptions): Tracer | un
                     project_type: 'observe'
                 })
             })
-            tracerProvider.addSpanProcessor(new SimpleSpanProcessor(traceExporter))
+            // Batch export keeps collector calls off the prediction path and bounds memory:
+            // when the collector is slow or down, spans beyond the queue are dropped, never the answer.
+            tracerProvider.addSpanProcessor(
+                new BatchSpanProcessor(traceExporter, {
+                    maxQueueSize: 2048,
+                    maxExportBatchSize: 512,
+                    scheduledDelayMillis: 1000,
+                    exportTimeoutMillis: 10000
+                })
+            )
             futureAgiProviders.set(key, tracerProvider)
         }
         return tracerProvider.getTracer('futureagi-tracer')
@@ -191,7 +223,7 @@ export function getFutureAGITracer(options: FutureAGITracerOptions): Tracer | un
 // Per-run LangChain callback that records OpenInference spans with the given tracer.
 // The OpenInference package only exports its process-global instrumentation, so
 // its callback tracer is loaded from next to the package entry point.
-export function getFutureAGILangChainCallback(tracer: Tracer): BaseCallbackHandler | undefined {
+export function getFutureAGILangChainCallback(tracer: Tracer | ApiTracer): BaseCallbackHandler | undefined {
     try {
         const entry = require.resolve('@arizeai/openinference-instrumentation-langchain')
         const { LangChainTracer: OpenInferenceTracer } = require(join(dirname(entry), 'tracer'))
@@ -737,11 +769,26 @@ export const additionalCallbacks = async (nodeData: INodeData, options: ICommonO
                         apiKey: futureAgiApiKey,
                         secretKey: futureAgiSecretKey,
                         baseUrl: futureAgiEndpoint || 'https://api.futureagi.com',
-                        projectName: futureAgiProject
+                        projectName: futureAgiProject,
+                        // Read from the credential only, so no flow input or API override can turn hiding off.
+                        hideInputs: credentialData?.futureAgiHideInputs,
+                        hideOutputs: credentialData?.futureAgiHideOutputs
                     }
 
+                    // Every span of this prediction carries the chat id as session.id and, when the caller
+                    // passes overrideConfig.analytics.futureAgi.userId, the user id.
                     const tracer: Tracer | undefined = getFutureAGITracer(futureAgiOptions)
-                    const handler = tracer ? getFutureAGILangChainCallback(tracer) : undefined
+                    const runTracer = tracer
+                        ? tracerWithAttributes(
+                              tracer,
+                              runAttributes({
+                                  sessionId: options.chatId,
+                                  userId: nodeData?.inputs?.analytics?.futureAgi?.userId,
+                                  chatflowId: options.chatflowid
+                              })
+                          )
+                        : undefined
+                    const handler = runTracer ? getFutureAGILangChainCallback(runTracer) : undefined
                     if (handler) callbacks.push(handler)
                 } else if (provider === 'opik') {
                     const opikApiKey = getCredentialParam('opikApiKey', credentialData, nodeData)
@@ -1011,10 +1058,24 @@ export class AnalyticHandler {
                 apiKey: futureAgiApiKey,
                 secretKey: futureAgiSecretKey,
                 baseUrl: futureAgiEndpoint || 'https://api.futureagi.com',
-                projectName: futureAgiProject
+                projectName: futureAgiProject,
+                // Read from the credential only, so no flow input or API override can turn hiding off.
+                hideInputs: credentialData?.futureAgiHideInputs,
+                hideOutputs: credentialData?.futureAgiHideOutputs
             }
 
-            const futureAgi: Tracer | undefined = getFutureAGITracer(futureAgiOptions)
+            const tracer: Tracer | undefined = getFutureAGITracer(futureAgiOptions)
+            // Every span of this run carries the chat id as session.id and the caller's user id, if any.
+            const futureAgi = tracer
+                ? tracerWithAttributes(
+                      tracer,
+                      runAttributes({
+                          sessionId: this.options.chatId,
+                          userId: this.nodeData?.inputs?.analytics?.futureAgi?.userId,
+                          chatflowId: this.options.chatflowid
+                      })
+                  )
+                : undefined
             const rootSpan: Span | undefined = undefined
 
             this.handlers['futureAgi'] = { client: futureAgi, futureAgiProject, rootSpan }

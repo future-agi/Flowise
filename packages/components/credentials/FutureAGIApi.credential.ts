@@ -36,7 +36,25 @@ class FutureAGIApi implements INodeCredential {
                 label: 'Project',
                 name: 'futureAgiProject',
                 type: 'string',
-                placeholder: 'default'
+                placeholder: 'default',
+                description: 'Observe project the traces go to. The Analyse settings can override it per flow. Defaults to "default".',
+                optional: true
+            },
+            {
+                label: 'Hide Inputs',
+                name: 'futureAgiHideInputs',
+                type: 'boolean',
+                description:
+                    'Do not export prompts, input messages, tool arguments or any other input text. Same as FI_HIDE_INPUTS=true on the Flowise server.',
+                optional: true
+            },
+            {
+                label: 'Hide Outputs',
+                name: 'futureAgiHideOutputs',
+                type: 'boolean',
+                description:
+                    'Do not export model responses, tool results, retrieved documents or any other output text. Same as FI_HIDE_OUTPUTS=true on the Flowise server.',
+                optional: true
             }
         ]
     }
