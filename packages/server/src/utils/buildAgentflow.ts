@@ -2002,7 +2002,8 @@ export const executeAgentFlow = async ({
                 databaseEntities,
                 componentNodes,
                 analytic: chatflow.analytic,
-                chatId
+                chatId,
+                chatflowid: chatflow.id
             })
             await analyticHandlers.init()
             if (analyticHandlers?.hasActiveProviders()) {

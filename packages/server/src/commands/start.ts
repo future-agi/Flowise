@@ -1,3 +1,4 @@
+import { flushFutureAGITracers } from 'flowise-components'
 import * as Server from '../index'
 import * as DataSource from '../DataSource'
 import logger from '../utils/logger'
@@ -23,6 +24,8 @@ export default class Start extends BaseCommand {
             logger.info(`Shutting down Flowise...`)
             const serverApp = Server.getInstance()
             if (serverApp) await serverApp.stopApp()
+            // Export the last batch of Future AGI spans before the process exits.
+            await flushFutureAGITracers()
         } catch (error) {
             logger.error('There was an error shutting down Flowise...', error)
             await this.failExit()
