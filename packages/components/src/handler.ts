@@ -1,5 +1,7 @@
 import { Logger } from 'winston'
 import { URL } from 'url'
+import { createRequire } from 'module'
+import { dirname, join } from 'path'
 import { v4 as uuidv4 } from 'uuid'
 import { Client } from 'langsmith'
 import CallbackHandler from 'langfuse-langchain'
@@ -8,12 +10,12 @@ import { RunTree, RunTreeConfig, Client as LangsmithClient } from 'langsmith'
 import { Langfuse, LangfuseTraceClient, LangfuseSpanClient, LangfuseGenerationClient } from 'langfuse'
 import { LangChainInstrumentation } from '@arizeai/openinference-instrumentation-langchain'
 import { Metadata } from '@grpc/grpc-js'
-import opentelemetry, { Span, SpanStatusCode } from '@opentelemetry/api'
+import opentelemetry, { Span, SpanStatusCode, Tracer as ApiTracer } from '@opentelemetry/api'
 import { OTLPTraceExporter as GrpcOTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-grpc'
 import { OTLPTraceExporter as ProtoOTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto'
 import { registerInstrumentations } from '@opentelemetry/instrumentation'
 import { Resource } from '@opentelemetry/resources'
-import { SimpleSpanProcessor, Tracer } from '@opentelemetry/sdk-trace-base'
+import { BatchSpanProcessor, SimpleSpanProcessor, Tracer } from '@opentelemetry/sdk-trace-base'
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node'
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions'
 import { BaseCallbackHandler, NewTokenIndices, HandleLLMNewTokenCallbackFields } from '@langchain/core/callbacks/base'
@@ -25,6 +27,15 @@ import { AgentAction } from '@langchain/core/agents'
 import { LunaryHandler } from '@langchain/community/callbacks/handlers/lunary'
 
 import { getCredentialData, getCredentialParam, getEnvironmentVariable } from './utils'
+import {
+    collectorEndpoint,
+    exporterHeaders,
+    FutureAGISpanExporter,
+    resolvePrivacy,
+    resolveProjectName,
+    runAttributes,
+    tracerWithAttributes
+} from './futureagi'
 import { applyEnvTracingProviders, tracingEnvEnabled } from './tracingEnv'
 import { EvaluationRunTracer } from '../evaluation/EvaluationRunTracer'
 import { EvaluationRunTracerLlama } from '../evaluation/EvaluationRunTracerLlama'
@@ -133,6 +144,93 @@ export function getPhoenixTracer(options: PhoenixTracerOptions): Tracer | undefi
         return tracerProvider.getTracer(`phoenix-tracer-${uuidv4().toString()}`)
     } catch (err) {
         if (process.env.DEBUG === 'true') console.error(`Error setting up Phoenix tracer: ${err.message}`)
+        return undefined
+    }
+}
+
+interface FutureAGITracerOptions {
+    apiKey: string
+    secretKey: string
+    baseUrl: string
+    projectName: string
+    hideInputs?: boolean | string
+    hideOutputs?: boolean | string
+}
+
+// One provider per collector, credential, project and privacy setting, reused across runs
+// rather than building a new exporter for every prediction.
+const futureAgiProviders = new Map<string, NodeTracerProvider>()
+
+/**
+ * Exports every buffered Future AGI span. Called on shutdown so the last batch is not lost.
+ */
+export async function flushFutureAGITracers(): Promise<void> {
+    await Promise.all(Array.from(futureAgiProviders.values()).map((provider) => provider.forceFlush().catch(() => undefined)))
+}
+
+// fi-collector reads X-Api-Key and X-Secret-Key and requires a project_name
+// resource attribute. The Phoenix exporter sends api_key plus a Bearer token
+// and openinference.project.name, which the collector rejects, so this is a
+// separate tracer rather than a retarget of getPhoenixTracer.
+//
+// Unlike getPhoenixTracer this never registers a global provider or patches
+// LangChain process-wide. That patch binds every LangChain call in the process,
+// from any flow or workspace, to whichever provider registered first, so other
+// flows would be exported to this credential's project.
+export function getFutureAGITracer(options: FutureAGITracerOptions): Tracer | undefined {
+    try {
+        const exporterUrl = collectorEndpoint(options.baseUrl)
+        const privacy = resolvePrivacy({ hideInputs: options.hideInputs, hideOutputs: options.hideOutputs })
+        const key = JSON.stringify([exporterUrl, options.apiKey, options.secretKey, options.projectName, privacy])
+        let tracerProvider = futureAgiProviders.get(key)
+        if (!tracerProvider) {
+            // Spans are scrubbed (hidden content, stack traces, local paths) before they leave the process.
+            const traceExporter = new FutureAGISpanExporter(
+                new ProtoOTLPTraceExporter({
+                    url: exporterUrl,
+                    headers: exporterHeaders(options.apiKey, options.secretKey),
+                    timeoutMillis: 10000
+                }),
+                privacy
+            )
+            tracerProvider = new NodeTracerProvider({
+                resource: new Resource({
+                    [ATTR_SERVICE_NAME]: options.projectName,
+                    [ATTR_SERVICE_VERSION]: '1.0.0',
+                    project_name: options.projectName,
+                    project_type: 'observe'
+                })
+            })
+            // Batch export keeps collector calls off the prediction path and bounds memory:
+            // when the collector is slow or down, spans beyond the queue are dropped, never the answer.
+            tracerProvider.addSpanProcessor(
+                new BatchSpanProcessor(traceExporter, {
+                    maxQueueSize: 2048,
+                    maxExportBatchSize: 512,
+                    scheduledDelayMillis: 1000,
+                    exportTimeoutMillis: 10000
+                })
+            )
+            futureAgiProviders.set(key, tracerProvider)
+        }
+        return tracerProvider.getTracer('futureagi-tracer')
+    } catch (err) {
+        if (process.env.DEBUG === 'true') console.error(`Error setting up Future AGI tracer: ${err.message}`)
+        return undefined
+    }
+}
+
+// Per-run LangChain callback that records OpenInference spans with the given tracer.
+// The OpenInference package only exports its process-global instrumentation, so
+// its callback tracer is loaded from next to the package entry point.
+export function getFutureAGILangChainCallback(tracer: Tracer | ApiTracer): BaseCallbackHandler | undefined {
+    try {
+        const entry = require.resolve('@arizeai/openinference-instrumentation-langchain')
+        const { LangChainTracer: OpenInferenceTracer } = require(join(dirname(entry), 'tracer'))
+        const { OITracer } = createRequire(entry)('@arizeai/openinference-core')
+        return new OpenInferenceTracer(new OITracer({ tracer }))
+    } catch (err) {
+        if (process.env.DEBUG === 'true') console.error(`Error setting up Future AGI LangChain callback: ${err.message}`)
         return undefined
     }
 }
@@ -658,6 +756,40 @@ export const additionalCallbacks = async (nodeData: INodeData, options: ICommonO
 
                     const tracer: Tracer | undefined = getPhoenixTracer(phoenixOptions)
                     callbacks.push(tracer)
+                } else if (provider === 'futureAgi') {
+                    const futureAgiApiKey = getCredentialParam('futureAgiApiKey', credentialData, nodeData)
+                    const futureAgiSecretKey = getCredentialParam('futureAgiSecretKey', credentialData, nodeData)
+                    const futureAgiEndpoint = getCredentialParam('futureAgiEndpoint', credentialData, nodeData)
+                    const futureAgiProject = resolveProjectName(
+                        analytic[provider].projectName as string,
+                        getCredentialParam('futureAgiProject', credentialData, nodeData)
+                    )
+
+                    const futureAgiOptions: FutureAGITracerOptions = {
+                        apiKey: futureAgiApiKey,
+                        secretKey: futureAgiSecretKey,
+                        baseUrl: futureAgiEndpoint || 'https://api.futureagi.com',
+                        projectName: futureAgiProject,
+                        // Read from the credential only, so no flow input or API override can turn hiding off.
+                        hideInputs: credentialData?.futureAgiHideInputs,
+                        hideOutputs: credentialData?.futureAgiHideOutputs
+                    }
+
+                    // Every span of this prediction carries the chat id as session.id and, when the caller
+                    // passes overrideConfig.analytics.futureAgi.userId, the user id.
+                    const tracer: Tracer | undefined = getFutureAGITracer(futureAgiOptions)
+                    const runTracer = tracer
+                        ? tracerWithAttributes(
+                              tracer,
+                              runAttributes({
+                                  sessionId: options.chatId,
+                                  userId: nodeData?.inputs?.analytics?.futureAgi?.userId,
+                                  chatflowId: options.chatflowid
+                              })
+                          )
+                        : undefined
+                    const handler = runTracer ? getFutureAGILangChainCallback(runTracer) : undefined
+                    if (handler) callbacks.push(handler)
                 } else if (provider === 'opik') {
                     const opikApiKey = getCredentialParam('opikApiKey', credentialData, nodeData)
                     const opikEndpoint = getCredentialParam('opikUrl', credentialData, nodeData)
@@ -769,6 +901,28 @@ export class AnalyticHandler {
             llmSpan.setStatus({ code: SpanStatusCode.OK })
             llmSpan.end()
         }
+    }
+
+    /**
+     * Ends the Future AGI root span when the chain that opened it ends, recording the run's output or error.
+     */
+    private _endFutureAGIRootSpan(returnIds: ICommonObject, output?: string | object, error?: string | object): void {
+        const handler = this.handlers['futureAgi']
+        const rootSpan: Span | undefined = handler.rootSpan
+        if (!rootSpan || handler.rootChainSpanId !== returnIds['futureAgi']?.chainSpan) return
+        if (error !== undefined) {
+            rootSpan.setAttribute('error.value', JSON.stringify(error))
+            rootSpan.setAttribute('error.mime_type', 'application/json')
+            rootSpan.setStatus({ code: SpanStatusCode.ERROR, message: error.toString() })
+        } else {
+            const text = typeof output === 'string'
+            rootSpan.setAttribute('output.value', text ? (output as string) : JSON.stringify(output))
+            rootSpan.setAttribute('output.mime_type', text ? 'text/plain' : 'application/json')
+            rootSpan.setStatus({ code: SpanStatusCode.OK })
+        }
+        rootSpan.end()
+        handler.rootSpan = undefined
+        handler.rootChainSpanId = undefined
     }
 
     async init() {
@@ -891,6 +1045,40 @@ export class AnalyticHandler {
             const rootSpan: Span | undefined = undefined
 
             this.handlers['phoenix'] = { client: phoenix, phoenixProject, rootSpan }
+        } else if (provider === 'futureAgi') {
+            const futureAgiApiKey = getCredentialParam('futureAgiApiKey', credentialData, this.nodeData)
+            const futureAgiSecretKey = getCredentialParam('futureAgiSecretKey', credentialData, this.nodeData)
+            const futureAgiEndpoint = getCredentialParam('futureAgiEndpoint', credentialData, this.nodeData)
+            const futureAgiProject = resolveProjectName(
+                providerConfig.projectName as string,
+                getCredentialParam('futureAgiProject', credentialData, this.nodeData)
+            )
+
+            const futureAgiOptions: FutureAGITracerOptions = {
+                apiKey: futureAgiApiKey,
+                secretKey: futureAgiSecretKey,
+                baseUrl: futureAgiEndpoint || 'https://api.futureagi.com',
+                projectName: futureAgiProject,
+                // Read from the credential only, so no flow input or API override can turn hiding off.
+                hideInputs: credentialData?.futureAgiHideInputs,
+                hideOutputs: credentialData?.futureAgiHideOutputs
+            }
+
+            const tracer: Tracer | undefined = getFutureAGITracer(futureAgiOptions)
+            // Every span of this run carries the chat id as session.id and the caller's user id, if any.
+            const futureAgi = tracer
+                ? tracerWithAttributes(
+                      tracer,
+                      runAttributes({
+                          sessionId: this.options.chatId,
+                          userId: this.nodeData?.inputs?.analytics?.futureAgi?.userId,
+                          chatflowId: this.options.chatflowid
+                      })
+                  )
+                : undefined
+            const rootSpan: Span | undefined = undefined
+
+            this.handlers['futureAgi'] = { client: futureAgi, futureAgiProject, rootSpan }
         } else if (provider === 'opik') {
             const opikApiKey = getCredentialParam('opikApiKey', credentialData, this.nodeData)
             const opikEndpoint = getCredentialParam('opikUrl', credentialData, this.nodeData)
@@ -921,6 +1109,7 @@ export class AnalyticHandler {
             langWatch: {},
             arize: {},
             phoenix: {},
+            futureAgi: {},
             opik: {}
         }
 
@@ -1112,6 +1301,40 @@ export class AnalyticHandler {
             returnIds['phoenix'].chainSpan = chainSpanId
         }
 
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'futureAgi')) {
+            const tracer: Tracer | undefined = this.handlers['futureAgi'].client
+            let rootSpan: Span | undefined = this.handlers['futureAgi'].rootSpan
+            // The root span stays open until the chain that opened it ends, so the trace
+            // carries the run's real output, status and duration.
+            const opensRoot = (!parentIds || !Object.keys(parentIds).length) && !rootSpan
+
+            if (opensRoot) {
+                rootSpan = tracer ? tracer.startSpan('Flowise') : undefined
+                if (rootSpan) {
+                    rootSpan.setAttribute('session.id', this.options.chatId)
+                    rootSpan.setAttribute('openinference.span.kind', 'CHAIN')
+                    rootSpan.setAttribute('input.value', input)
+                    rootSpan.setAttribute('input.mime_type', 'text/plain')
+                }
+                this.handlers['futureAgi'].rootSpan = rootSpan
+            }
+
+            const rootSpanContext = rootSpan
+                ? opentelemetry.trace.setSpan(opentelemetry.context.active(), rootSpan as Span)
+                : opentelemetry.context.active()
+            const chainSpan = tracer?.startSpan(name, undefined, rootSpanContext)
+            if (chainSpan) {
+                chainSpan.setAttribute('openinference.span.kind', 'CHAIN')
+                chainSpan.setAttribute('input.value', JSON.stringify(input))
+                chainSpan.setAttribute('input.mime_type', 'application/json')
+            }
+            const chainSpanId: any = chainSpan?.spanContext().spanId
+
+            this.handlers['futureAgi'].chainSpan = { ...this.handlers['futureAgi'].chainSpan, [chainSpanId]: chainSpan }
+            if (opensRoot) this.handlers['futureAgi'].rootChainSpanId = chainSpanId
+            returnIds['futureAgi'].chainSpan = chainSpanId
+        }
+
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'opik')) {
             const tracer: Tracer | undefined = this.handlers['opik'].client
             let rootSpan: Span | undefined = this.handlers['opik'].rootSpan
@@ -1224,6 +1447,17 @@ export class AnalyticHandler {
             }
         }
 
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'futureAgi')) {
+            const chainSpan: Span | undefined = this.handlers['futureAgi'].chainSpan[returnIds['futureAgi'].chainSpan]
+            if (chainSpan) {
+                chainSpan.setAttribute('output.value', JSON.stringify(output))
+                chainSpan.setAttribute('output.mime_type', 'application/json')
+                chainSpan.setStatus({ code: SpanStatusCode.OK })
+                chainSpan.end()
+            }
+            this._endFutureAGIRootSpan(returnIds, output)
+        }
+
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'opik')) {
             const chainSpan: Span | undefined = this.handlers['opik'].chainSpan[returnIds['opik'].chainSpan]
             if (chainSpan) {
@@ -1317,6 +1551,17 @@ export class AnalyticHandler {
             }
         }
 
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'futureAgi')) {
+            const chainSpan: Span | undefined = this.handlers['futureAgi'].chainSpan[returnIds['futureAgi'].chainSpan]
+            if (chainSpan) {
+                chainSpan.setAttribute('error.value', JSON.stringify(error))
+                chainSpan.setAttribute('error.mime_type', 'application/json')
+                chainSpan.setStatus({ code: SpanStatusCode.ERROR, message: error.toString() })
+                chainSpan.end()
+            }
+            this._endFutureAGIRootSpan(returnIds, undefined, error)
+        }
+
         if (shutdown) {
             // Cleanup this instance when chain ends
             AnalyticHandler.resetInstance(this.chatId)
@@ -1331,6 +1576,7 @@ export class AnalyticHandler {
             langWatch: {},
             arize: {},
             phoenix: {},
+            futureAgi: {},
             opik: {}
         }
 
@@ -1432,6 +1678,25 @@ export class AnalyticHandler {
 
             this.handlers['phoenix'].llmSpan = { [llmSpanId]: llmSpan }
             returnIds['phoenix'].llmSpan = llmSpanId
+        }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'futureAgi')) {
+            const tracer: Tracer | undefined = this.handlers['futureAgi'].client
+            const rootSpan: Span | undefined = this.handlers['futureAgi'].rootSpan
+
+            const rootSpanContext = rootSpan
+                ? opentelemetry.trace.setSpan(opentelemetry.context.active(), rootSpan as Span)
+                : opentelemetry.context.active()
+            const llmSpan = tracer?.startSpan(name, undefined, rootSpanContext)
+            if (llmSpan) {
+                llmSpan.setAttribute('openinference.span.kind', 'LLM')
+                llmSpan.setAttribute('input.value', JSON.stringify(input))
+                llmSpan.setAttribute('input.mime_type', 'application/json')
+            }
+            const llmSpanId: any = llmSpan?.spanContext().spanId
+
+            this.handlers['futureAgi'].llmSpan = { [llmSpanId]: llmSpan }
+            returnIds['futureAgi'].llmSpan = llmSpanId
         }
 
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'opik')) {
@@ -1608,6 +1873,10 @@ export class AnalyticHandler {
             this._endOtelSpan('phoenix', returnIds, outputText, usageMetadata, modelName)
         }
 
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'futureAgi')) {
+            this._endOtelSpan('futureAgi', returnIds, outputText, usageMetadata, modelName)
+        }
+
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'opik')) {
             this._endOtelSpan('opik', returnIds, outputText, usageMetadata, modelName)
         }
@@ -1676,6 +1945,16 @@ export class AnalyticHandler {
             }
         }
 
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'futureAgi')) {
+            const llmSpan: Span | undefined = this.handlers['futureAgi'].llmSpan[returnIds['futureAgi'].llmSpan]
+            if (llmSpan) {
+                llmSpan.setAttribute('error.value', JSON.stringify(error))
+                llmSpan.setAttribute('error.mime_type', 'application/json')
+                llmSpan.setStatus({ code: SpanStatusCode.ERROR, message: error.toString() })
+                llmSpan.end()
+            }
+        }
+
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'opik')) {
             const llmSpan: Span | undefined = this.handlers['opik'].llmSpan[returnIds['opik'].llmSpan]
             if (llmSpan) {
@@ -1695,6 +1974,7 @@ export class AnalyticHandler {
             langWatch: {},
             arize: {},
             phoenix: {},
+            futureAgi: {},
             opik: {}
         }
 
@@ -1794,6 +2074,25 @@ export class AnalyticHandler {
             returnIds['phoenix'].toolSpan = toolSpanId
         }
 
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'futureAgi')) {
+            const tracer: Tracer | undefined = this.handlers['futureAgi'].client
+            const rootSpan: Span | undefined = this.handlers['futureAgi'].rootSpan
+
+            const rootSpanContext = rootSpan
+                ? opentelemetry.trace.setSpan(opentelemetry.context.active(), rootSpan as Span)
+                : opentelemetry.context.active()
+            const toolSpan = tracer?.startSpan(name, undefined, rootSpanContext)
+            if (toolSpan) {
+                toolSpan.setAttribute('openinference.span.kind', 'TOOL')
+                toolSpan.setAttribute('input.value', JSON.stringify(input))
+                toolSpan.setAttribute('input.mime_type', 'application/json')
+            }
+            const toolSpanId: any = toolSpan?.spanContext().spanId
+
+            this.handlers['futureAgi'].toolSpan = { [toolSpanId]: toolSpan }
+            returnIds['futureAgi'].toolSpan = toolSpanId
+        }
+
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'opik')) {
             const tracer: Tracer | undefined = this.handlers['opik'].client
             const rootSpan: Span | undefined = this.handlers['opik'].rootSpan
@@ -1879,6 +2178,16 @@ export class AnalyticHandler {
             }
         }
 
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'futureAgi')) {
+            const toolSpan: Span | undefined = this.handlers['futureAgi'].toolSpan[returnIds['futureAgi'].toolSpan]
+            if (toolSpan) {
+                toolSpan.setAttribute('output.value', JSON.stringify(output))
+                toolSpan.setAttribute('output.mime_type', 'application/json')
+                toolSpan.setStatus({ code: SpanStatusCode.OK })
+                toolSpan.end()
+            }
+        }
+
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'opik')) {
             const toolSpan: Span | undefined = this.handlers['opik'].toolSpan[returnIds['opik'].toolSpan]
             if (toolSpan) {
@@ -1945,6 +2254,16 @@ export class AnalyticHandler {
 
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'phoenix')) {
             const toolSpan: Span | undefined = this.handlers['phoenix'].toolSpan[returnIds['phoenix'].toolSpan]
+            if (toolSpan) {
+                toolSpan.setAttribute('error.value', JSON.stringify(error))
+                toolSpan.setAttribute('error.mime_type', 'application/json')
+                toolSpan.setStatus({ code: SpanStatusCode.ERROR, message: error.toString() })
+                toolSpan.end()
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'futureAgi')) {
+            const toolSpan: Span | undefined = this.handlers['futureAgi'].toolSpan[returnIds['futureAgi'].toolSpan]
             if (toolSpan) {
                 toolSpan.setAttribute('error.value', JSON.stringify(error))
                 toolSpan.setAttribute('error.mime_type', 'application/json')

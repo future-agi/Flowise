@@ -1,3 +1,4 @@
+import { flushFutureAGITracers } from 'flowise-components'
 import logger from '../utils/logger'
 import { QueueManager } from '../queue/QueueManager'
 import { BaseCommand } from './base'
@@ -123,6 +124,9 @@ export default class Worker extends BaseCommand {
             const scheduleWorker = queueManager.getQueue('schedule').getWorker()
             logger.info(`Shutting down Flowise Schedule Worker ${this.scheduleWorkerId}...`)
             await scheduleWorker.close()
+
+            // Export the last batch of Future AGI spans before the process exits.
+            await flushFutureAGITracers()
         } catch (error) {
             logger.error('There was an error shutting down Flowise Worker...', error)
             await this.failExit()

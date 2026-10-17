@@ -1,11 +1,21 @@
 import { OTLPTraceExporter as ProtoOTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto'
-import { getPhoenixTracer, AnalyticHandler } from './handler'
+import { isPatched } from '@arizeai/openinference-instrumentation-langchain'
+import { awaitAllCallbacks } from '@langchain/core/callbacks/promises'
+import { RunnableLambda } from '@langchain/core/runnables'
+import { FakeListChatModel } from '@langchain/core/utils/testing'
+import { getPhoenixTracer, getFutureAGITracer, getFutureAGILangChainCallback, flushFutureAGITracers, AnalyticHandler } from './handler'
+import { runAttributes, tracerWithAttributes } from './futureagi'
 import { resetTracingEnvCache } from './tracingEnv'
 
 jest.mock('@opentelemetry/exporter-trace-otlp-proto', () => {
     return {
         OTLPTraceExporter: jest.fn().mockImplementation((args) => {
-            return { args }
+            return {
+                args,
+                export: jest.fn((_spans, done) => done({ code: 0 })),
+                shutdown: jest.fn().mockResolvedValue(undefined),
+                forceFlush: jest.fn().mockResolvedValue(undefined)
+            }
         })
     }
 })
@@ -83,6 +93,289 @@ describe('URL Handling For Phoenix Tracer', () => {
                 })
             })
         )
+    })
+})
+
+describe('URL Handling For Future AGI Tracer', () => {
+    const apiKey = 'test-api-key'
+    const secretKey = 'test-secret-key'
+    let projectCount = 0
+
+    // A fresh project per call keeps the provider cache from hiding the exporter construction under test.
+    const makeOptions = (baseUrl: string) => ({
+        baseUrl,
+        apiKey,
+        secretKey,
+        projectName: `test-project-${++projectCount}`
+    })
+
+    beforeEach(() => {
+        jest.clearAllMocks()
+    })
+
+    const cases: [string, string][] = [
+        ['https://api.futureagi.com', 'https://api.futureagi.com/tracer/v1/traces'],
+        ['https://api.futureagi.com/tracer/v1/traces', 'https://api.futureagi.com/tracer/v1/traces'],
+        ['https://collector.example.com/base', 'https://collector.example.com/base/tracer/v1/traces']
+    ]
+
+    it.each(cases)('baseUrl %s - exporterUrl %s', (input, expected) => {
+        getFutureAGITracer(makeOptions(input))
+        expect(ProtoOTLPTraceExporter).toHaveBeenCalledWith(
+            expect.objectContaining({
+                url: expected,
+                headers: {
+                    'X-Api-Key': apiKey,
+                    'X-Secret-Key': secretKey
+                }
+            })
+        )
+    })
+
+    it('does not send the Phoenix header names', () => {
+        getFutureAGITracer(makeOptions('https://api.futureagi.com'))
+        const call = (ProtoOTLPTraceExporter as unknown as jest.Mock).mock.calls[0][0]
+        expect(call.headers.api_key).toBeUndefined()
+        expect(call.headers.authorization).toBeUndefined()
+    })
+
+    it('reuses one exporter per collector, credential and project', () => {
+        const options = makeOptions('https://reuse.example.com')
+        getFutureAGITracer(options)
+        getFutureAGITracer({ ...options })
+        expect(ProtoOTLPTraceExporter).toHaveBeenCalledTimes(1)
+        getFutureAGITracer({ ...options, projectName: 'another-project' })
+        expect(ProtoOTLPTraceExporter).toHaveBeenCalledTimes(2)
+    })
+
+    it('builds a per-run LangChain callback without patching LangChain globally', () => {
+        const tracer = getFutureAGITracer(makeOptions('https://callback.example.com'))
+        const callback = getFutureAGILangChainCallback(tracer!)
+        expect(callback?.name).toBe('OpenInferenceLangChainTracer')
+        expect(isPatched()).toBe(false)
+    })
+})
+
+describe('AnalyticHandler Future AGI spans', () => {
+    const chatId = 'futureagi-spans-test'
+
+    afterEach(() => {
+        AnalyticHandler.resetInstance(chatId)
+    })
+
+    it('records the agentflow chain, LLM and tool spans', async () => {
+        const handler = AnalyticHandler.getInstance({ inputs: {} } as any, { chatId })
+        await handler.initializeProvider(
+            'futureAgi',
+            { projectName: 'agentflow-project' },
+            { futureAgiApiKey: 'k', futureAgiSecretKey: 's', futureAgiEndpoint: 'https://spans.example.com' }
+        )
+
+        const chainIds = await handler.onChainStart('Agentflow', 'What is 2 + 2?')
+        const llmIds = await handler.onLLMStart('ChatOpenAI', 'What is 2 + 2?', chainIds)
+        await handler.onLLMEnd(
+            llmIds,
+            { content: '4', usageMetadata: { input_tokens: 5, output_tokens: 1, total_tokens: 6 } },
+            { model: 'gpt-test' }
+        )
+        const toolIds = await handler.onToolStart('calculator', { input: '2 + 2' }, chainIds)
+        await handler.onToolEnd(toolIds, '4')
+        await handler.onChainEnd(chainIds, '4', true)
+        await flushFutureAGITracers()
+
+        const exporter = (ProtoOTLPTraceExporter as unknown as jest.Mock).mock.results.at(-1)!.value
+        expect(exporter.args.headers).toEqual({ 'X-Api-Key': 'k', 'X-Secret-Key': 's' })
+        const spans = exporter.export.mock.calls.flatMap(([batch]: [any[]]) => batch)
+        const kinds = Object.fromEntries(spans.map((span: any) => [span.name, span.attributes['openinference.span.kind']]))
+        expect(kinds).toEqual({ Flowise: 'CHAIN', Agentflow: 'CHAIN', ChatOpenAI: 'LLM', calculator: 'TOOL' })
+        const llm = spans.find((span: any) => span.name === 'ChatOpenAI')
+        expect(llm.attributes['llm.model_name']).toBe('gpt-test')
+        expect(llm.attributes['llm.token_count.total']).toBe(6)
+        const root = spans.find((span: any) => span.name === 'Flowise')
+        expect(root.attributes['session.id']).toBe(chatId)
+        expect(root.attributes['output.value']).toBe('4')
+        expect(root.status.code).toBe(1)
+        // The root covers the run: it ends after the chain it opened.
+        expect(spans.at(-1).name).toBe('Flowise')
+    })
+
+    it('marks the root span as an error when the run fails', async () => {
+        const handler = AnalyticHandler.getInstance({ inputs: {} } as any, { chatId })
+        await handler.initializeProvider(
+            'futureAgi',
+            { projectName: 'agentflow-error-project' },
+            { futureAgiApiKey: 'k', futureAgiSecretKey: 's', futureAgiEndpoint: 'https://errors.example.com' }
+        )
+
+        const chainIds = await handler.onChainStart('Agentflow', 'What is 2 + 2?')
+        const nestedIds = await handler.onChainStart('Iteration', 'nested')
+        await handler.onChainEnd(nestedIds, 'nested done')
+        await handler.onChainError(chainIds, 'model not found', true)
+        await flushFutureAGITracers()
+
+        const exporter = (ProtoOTLPTraceExporter as unknown as jest.Mock).mock.results.at(-1)!.value
+        const spans = exporter.export.mock.calls.flatMap(([batch]: [any[]]) => batch)
+        expect(spans.map((span: any) => span.name)).toEqual(['Iteration', 'Agentflow', 'Flowise'])
+        const root = spans.find((span: any) => span.name === 'Flowise')
+        expect(root.status).toEqual({ code: 2, message: 'model not found' })
+        const iteration = spans.find((span: any) => span.name === 'Iteration')
+        expect(iteration.parentSpanId).toBe(root.spanContext().spanId)
+    })
+})
+
+describe('Future AGI session, user, privacy and failure handling', () => {
+    const chatId = 'futureagi-run-attributes'
+    let projectCount = 0
+    const credential = (extra: Record<string, unknown> = {}) => ({
+        futureAgiApiKey: 'k',
+        futureAgiSecretKey: 's',
+        futureAgiEndpoint: `https://run-${++projectCount}.example.com`,
+        ...extra
+    })
+    const exportedSpans = () => {
+        const exporter = (ProtoOTLPTraceExporter as unknown as jest.Mock).mock.results.at(-1)!.value
+        return exporter.export.mock.calls.flatMap(([batch]: [any[]]) => batch)
+    }
+
+    afterEach(() => {
+        AnalyticHandler.resetInstance(chatId)
+        delete process.env.FI_HIDE_INPUTS
+        delete process.env.FI_HIDE_OUTPUTS
+    })
+
+    it('exports in batches off the prediction path', async () => {
+        const tracer = getFutureAGITracer({ baseUrl: 'https://batch.example.com', apiKey: 'k', secretKey: 's', projectName: 'batch' })
+        tracer!.startSpan('one').end()
+        const exporter = (ProtoOTLPTraceExporter as unknown as jest.Mock).mock.results.at(-1)!.value
+        expect(exporter.export).not.toHaveBeenCalled()
+        await flushFutureAGITracers()
+        expect(exporter.export).toHaveBeenCalledTimes(1)
+    })
+
+    it('stamps session and user on every agentflow span from the chat id and overrideConfig', async () => {
+        const handler = AnalyticHandler.getInstance({ inputs: { analytics: { futureAgi: { userId: 'user-42' } } } } as any, {
+            chatId,
+            chatflowid: 'flow-42'
+        })
+        await handler.initializeProvider('futureAgi', { projectName: 'run-attrs' }, credential())
+
+        const chainIds = await handler.onChainStart('Agentflow', 'hello')
+        const toolIds = await handler.onToolStart('calculator', { input: '2 + 2' }, chainIds)
+        await handler.onToolEnd(toolIds, '4')
+        await handler.onChainEnd(chainIds, 'done', true)
+        await flushFutureAGITracers()
+
+        const spans = exportedSpans()
+        expect(spans.map((span: any) => span.name).sort()).toEqual(['Agentflow', 'Flowise', 'calculator'])
+        for (const span of spans) {
+            expect(span.attributes['session.id']).toBe(chatId)
+            expect(span.attributes['user.id']).toBe('user-42')
+            expect(span.attributes['flowise.chatflow_id']).toBe('flow-42')
+        }
+    })
+
+    it('omits user.id when the caller passes none', async () => {
+        const handler = AnalyticHandler.getInstance({ inputs: {} } as any, { chatId })
+        await handler.initializeProvider('futureAgi', { projectName: 'no-user' }, credential())
+        const chainIds = await handler.onChainStart('Agentflow', 'hello')
+        await handler.onChainEnd(chainIds, 'done', true)
+        await flushFutureAGITracers()
+        for (const span of exportedSpans()) expect(span.attributes['user.id']).toBeUndefined()
+    })
+
+    it('hides inputs and outputs when the credential switches are on', async () => {
+        const handler = AnalyticHandler.getInstance({ inputs: {} } as any, { chatId })
+        await handler.initializeProvider(
+            'futureAgi',
+            { projectName: 'hidden' },
+            credential({ futureAgiHideInputs: true, futureAgiHideOutputs: true })
+        )
+        const chainIds = await handler.onChainStart('Agentflow', 'MARKER question')
+        const llmIds = await handler.onLLMStart('ChatOpenAI', 'MARKER question', chainIds)
+        await handler.onLLMEnd(
+            llmIds,
+            { content: 'MARKER answer', usageMetadata: { input_tokens: 5, output_tokens: 1 } },
+            { model: 'gpt-test' }
+        )
+        const toolIds = await handler.onToolStart('calculator', { input: 'MARKER' }, chainIds)
+        await handler.onToolEnd(toolIds, 'MARKER result')
+        await handler.onChainEnd(chainIds, 'MARKER answer', true)
+        await flushFutureAGITracers()
+
+        const spans = exportedSpans()
+        expect(spans).toHaveLength(4)
+        expect(JSON.stringify(spans.map((span: any) => ({ attributes: span.attributes, status: span.status })))).not.toContain('MARKER')
+        const llm = spans.find((span: any) => span.name === 'ChatOpenAI')
+        expect(llm.attributes['llm.model_name']).toBe('gpt-test')
+        expect(llm.attributes['openinference.span.kind']).toBe('LLM')
+    })
+
+    it('keeps content hidden even if the flow inputs carry a hide switch set to false', async () => {
+        const handler = AnalyticHandler.getInstance({ inputs: { futureAgiHideInputs: false, futureAgiHideOutputs: false } } as any, {
+            chatId
+        })
+        await handler.initializeProvider(
+            'futureAgi',
+            { projectName: 'hidden-override' },
+            credential({ futureAgiHideInputs: true, futureAgiHideOutputs: true })
+        )
+        const chainIds = await handler.onChainStart('Agentflow', 'MARKER question')
+        await handler.onChainEnd(chainIds, 'MARKER answer', true)
+        await flushFutureAGITracers()
+        expect(JSON.stringify(exportedSpans().map((span: any) => span.attributes))).not.toContain('MARKER')
+    })
+
+    it('hides inputs when FI_HIDE_INPUTS is set on the server', async () => {
+        process.env.FI_HIDE_INPUTS = 'true'
+        const handler = AnalyticHandler.getInstance({ inputs: {} } as any, { chatId })
+        await handler.initializeProvider('futureAgi', { projectName: 'env-hidden' }, credential())
+        const chainIds = await handler.onChainStart('Agentflow', 'MARKER question')
+        await handler.onChainEnd(chainIds, 'visible answer', true)
+        await flushFutureAGITracers()
+        const root = exportedSpans().find((span: any) => span.name === 'Flowise')
+        expect(root.attributes['input.value']).toBeUndefined()
+        expect(root.attributes['output.value']).toBe('visible answer')
+    })
+
+    it('records LangChain chatflow runs with session, user, tokens and a stack-free error', async () => {
+        const tracer = getFutureAGITracer({ baseUrl: 'https://chatflow.example.com', apiKey: 'k', secretKey: 's', projectName: 'chatflow' })
+        const runTracer = tracerWithAttributes(tracer!, runAttributes({ sessionId: 'chat-7', userId: 'user-7', chatflowId: 'flow-7' }))
+        const callback = getFutureAGILangChainCallback(runTracer)!
+
+        const model = new FakeListChatModel({ responses: ['4'] })
+        await model.invoke('What is 2 + 2?', { callbacks: [callback] })
+        const failing = RunnableLambda.from(() => {
+            throw new Error('tool exploded')
+        }).withConfig({ runName: 'FailingTool' })
+        await expect(failing.invoke('x', { callbacks: [callback] })).rejects.toThrow('tool exploded')
+        await awaitAllCallbacks()
+        await flushFutureAGITracers()
+
+        const spans = exportedSpans()
+        const llm = spans.find((span: any) => span.attributes['openinference.span.kind'] === 'LLM')
+        expect(llm.attributes['session.id']).toBe('chat-7')
+        expect(llm.attributes['user.id']).toBe('user-7')
+        expect(llm.attributes['flowise.chatflow_id']).toBe('flow-7')
+        expect(llm.attributes['output.value']).toContain('4')
+        const failed = spans.find((span: any) => span.name === 'FailingTool')
+        expect(failed.status.code).toBe(2)
+        // LangChain stores message + "\n\n" + stack; only the message is exported.
+        expect(failed.status.message).toBe('tool exploded')
+        expect(JSON.stringify(spans.map((span: any) => [span.attributes, span.status]))).not.toContain('handler.test')
+    })
+
+    it('never fails the prediction when the collector is down', async () => {
+        ;(ProtoOTLPTraceExporter as unknown as jest.Mock).mockImplementationOnce((args) => ({
+            args,
+            export: jest.fn((_spans, done) => done({ code: 1, error: new Error('connect ECONNREFUSED') })),
+            shutdown: jest.fn().mockResolvedValue(undefined),
+            forceFlush: jest.fn().mockResolvedValue(undefined)
+        }))
+        const handler = AnalyticHandler.getInstance({ inputs: {} } as any, { chatId })
+        await handler.initializeProvider('futureAgi', { projectName: 'collector-down' }, credential())
+        const chainIds = await handler.onChainStart('Agentflow', 'hello')
+        await expect(handler.onChainEnd(chainIds, 'done', true)).resolves.not.toThrow()
+        await expect(flushFutureAGITracers()).resolves.toBeUndefined()
     })
 })
 
